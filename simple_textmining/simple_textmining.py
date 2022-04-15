@@ -19,6 +19,7 @@ from wordcloud import WordCloud
 import xlsxwriter
 import matplotlib
 import matplotlib.pyplot as plt
+import scipy.stats
 tqdm.tqdm.pandas()
 
 def mpl_to_xlsx(worksheet, row, col, fig):
@@ -32,7 +33,21 @@ def mpl_to_xlsx(worksheet, row, col, fig):
     imgdata.seek(0)
     worksheet.insert_image(row, col, '', {'image_data': imgdata})
 
-class simple_textmining:
+def pvalue_asterisk(pvalue):
+
+    asterisk = ''
+    if pvalue < .05:
+        asterisk = asterisk + '*'
+    if pvalue < .01:
+        asterisk = asterisk + '*'
+    if pvalue < .001:
+        asterisk = asterisk + '*'
+    if pvalue < .0001:
+        asterisk = asterisk + '*'
+
+    return asterisk
+
+class textminer:
 
     def __init__(self,
                  df,
@@ -92,8 +107,6 @@ class simple_textmining:
 
     def build(self):
 
-        # TODO: maybe make docs and terms_list into Series rather than DataFrames
-
         if self.docs is None:
 
             tqdm.tqdm.write('Creating Spacy docs.', file=sys.stderr)
@@ -142,11 +155,12 @@ class simple_textmining:
 
     def keyword_extraction(self):
 
+        d = {}
         if self.keyword_algo:
 
             tqdm.tqdm.write('Extracting keywords.', file=sys.stderr)
 
-            d = {}
+            dd = {}
             for row, data in tqdm.tqdm(self.docs.iteritems()):
 
                 # TODO: allow multiple algos
@@ -154,10 +168,14 @@ class simple_textmining:
                     keyterms = textacy.extract.keyterms.sgrank(data, topn=self.keyword_topn)
 
                     # TODO: this should be a bit more robust, e.g. if there is no keyterms
-                    d[row] = [x[0].lower() for x in keyterms]
+                    dd[row] = [x[0].lower() for x in keyterms]
+
+            d['_top_keywords_{}'.format(self.keyword_algo)] = dd
 
             # TODO: this could be dataframe with keyword algo in header
-            self.df['_top_keywords_{}'.format(self.keyword_algo)] = pd.Series(d)
+            # TODO: then df_init can be removed?
+        #self.df['_top_keywords_{}'.format(self.keyword_algo)] = pd.Series(d)
+        self.keywords = pd.DataFrame(d)
 
     def word_counts(self):
 
@@ -189,47 +207,40 @@ class simple_textmining:
         # Run topic model
         model = textacy.tm.TopicModel(self.model_type, n_topics=self.n_topics)
         model.fit(doc_term_matrix)
-        doc_topic_matrix = model.transform(doc_term_matrix)
 
         # Build top terms
         top_terms_str = []
         for topic_idx, top_terms in model.top_topic_terms(tvectorizer.id_to_term):
             top_terms_str.append('TOPIC {}: {}'.format(str(topic_idx).zfill(2), ', '.join(top_terms)))
 
+        # Build matrices
+        doc_topic_matrix = model.transform(doc_term_matrix)
         docs_terms_weights = list(model.top_topic_terms(tvectorizer.id_to_term, weights=True, top_n=-1))
 
         # Get dominant topics
-
         # NOTE: this finds multiple dominant topics if there are
         dominant_topics = []
         for row in doc_topic_matrix:
             max_index = row.argmax()
             max_indexes = np.where(row == row[max_index])[0]
             dominant_topics.append([top_terms_str[x] for x in max_indexes])
-        self.dominant_topics = pd.Series(dominant_topics, index=self.df.index)
-        
-        # TODO: dont do this, join when reporting tm
-        self.df['_dominant_topics'] = pd.Series(dominant_topics, index=self.df.index)
+        self.dominant_topics = pd.DataFrame(dominant_topics, index=self.df.index, columns=['_dominant_topics'])
 
         # This gets just one dominant topic
         dominant_topic = []
         for row in doc_topic_matrix:
             max_index = row.argmax()
             dominant_topic.append(top_terms_str[max_index])
-        self.dominant_topic = pd.Series(dominant_topic, index=self.df.index)    
-        
-        # TODO: dont do this, join when reporting tm
-        self.df['_dominant_topic'] = pd.Series(dominant_topic, index=self.df.index)
+        self.dominant_topic = pd.DataFrame(dominant_topic, index=self.df.index, columns=['_dominant_topic'])
 
-        self.top_terms = pd.DataFrame(
+        # TODO: rename this
+        top_terms = pd.DataFrame(
             doc_topic_matrix,
             columns=top_terms_str,
             index=self.df.index)
-        
-        # TODO: dont do this, join when reporting tm
-        self.df = self.df.join(pd.DataFrame(doc_topic_matrix,
-                                            columns=top_terms_str,
-                                            index=self.df.index))
+
+        # Boolean indicator matrix for terms
+        self.top_terms_boolean = top_terms[top_terms != 0]
 
         self.model = model
         self.doc_term_matrix = doc_term_matrix
@@ -237,6 +248,7 @@ class simple_textmining:
         self.doc_topic_matrix = doc_topic_matrix
         self.tvectorizer = tvectorizer
         self.docs_terms_weights = docs_terms_weights
+        self.top_terms = top_terms
 
     def report_counts(self):
 
@@ -264,8 +276,8 @@ class simple_textmining:
 
         worksheet.add_table(
             table_range,
-            table_style)        
-        
+            table_style)
+
         # Add conditional format for counts
         worksheet.conditional_format(
             1,
@@ -276,13 +288,19 @@ class simple_textmining:
              'min_value': 0,
              'min_color': '#FFFFFF',
              'max_value': self.df_vectorized.max().max(),
-             'max_color': '#4f81bd'})        
+             'max_color': '#4f81bd'})
 
     def report_tm(self):
 
+        # TODO: maybe also report sentiment analysis here for easier analysis
+        # TODO: compare average sentiments per dominant theme?
+
         tqdm.tqdm.write('Reporting topic model.', file=sys.stderr)
 
-        table = self.df
+        # TODO: define empty dataframes or check whether these actually exist before concating
+        table = pd.concat(
+            [self.df, self.keywords, self.polarities, self.dominant_topics, self.dominant_topic, self.top_terms],
+            axis='columns')
 
         table.to_excel(
             self.writer,
@@ -338,8 +356,8 @@ class simple_textmining:
             3,
             columns.index(self.top_terms_str[0]),
             len(table.index) + 2,
-            columns.index(self.top_terms_str[-1]))        
-        
+            columns.index(self.top_terms_str[-1]))
+
         worksheet.conditional_format(weights_range,
                                      {'type': '2_color_scale',
                                       'min_value': 0,
@@ -370,6 +388,42 @@ class simple_textmining:
 
         # Freeze top rows
         worksheet.freeze_panes(3, 0)
+
+    def report_topic_sentiment(self):
+
+        tqdm.tqdm.write('Reporting topic model sentiments.', file=sys.stderr)
+
+        worksheet = self.writer.book.add_worksheet('topic_sentiments')
+
+        for row, (term, termdata) in enumerate(self.top_terms.iteritems()):
+
+            col = 0
+
+            # Topic name
+            worksheet.write(0, col, 'Topic')
+            worksheet.write(row + 1, col, term)
+
+            # Non-zero topic weight mean
+            col = col + 1
+            worksheet.write(0, col, 'Non-zero topic weight NLTK sentiment compound M')
+            worksheet.write(row + 1, col, self.polarities[termdata != 0]._NLTK_sentiment_compound.mean())
+
+            # Correlation coefficient between term weight and sentiment compound
+            r = scipy.stats.pearsonr(
+                termdata,
+                self.polarities._NLTK_sentiment_compound)
+
+            col = col + 1
+            worksheet.write(0, col, 'pearson r')
+            worksheet.write(row + 1, col, r[0])
+
+            col = col + 1
+            worksheet.write(0, col, 'pearson r p-value')
+            worksheet.write(row + 1, col, r[1])
+
+            col = col + 1
+            worksheet.write(0, col, 'pearson r p-value sig.')
+            worksheet.write(row + 1, col, pvalue_asterisk(r[1]))
 
     def report_wordclouds(self):
 
@@ -409,7 +463,7 @@ class simple_textmining:
 
         fig, ax = plt.subplots(figsize=(16, 9))
 
-        self.df._dominant_topics.value_counts().plot.barh(ax=ax)
+        self.dominant_topics.value_counts().plot.barh(ax=ax)
 
         plt.tight_layout()
         mpl_to_xlsx(worksheet, 0, 0, fig)
@@ -528,6 +582,7 @@ class simple_textmining:
         for row, doc in tqdm.tqdm(self.docs.iteritems()):
             moods[row] = rs.get_emotional_valence(doc)
         self.moods = pd.DataFrame.from_dict(moods, orient='index')
+        self.moods = self.moods.add_prefix('_DepecheMood_')
 
         # NLTK
         from nltk.sentiment import SentimentIntensityAnalyzer
@@ -537,6 +592,7 @@ class simple_textmining:
         for row, doc in tqdm.tqdm(self.docs.iteritems()):
             pols[row] = sia.polarity_scores(doc.text)
         self.polarities = pd.DataFrame.from_dict(pols, orient='index')
+        self.polarities = self.polarities.add_prefix('_NLTK_sentiment_')
 
     def report_sentiment_analysis(self):
 
@@ -628,7 +684,7 @@ class simple_textmining:
 
         self.highlighted_format = self.writer.book.add_format({
             'bold': True})
-        
+
         # TODO: use this in tables
         self.table_style = {
             'style': 'Table Style Light 15',
@@ -644,11 +700,13 @@ class simple_textmining:
         self.sentiment_analysis()
         self.cooccurrence_network()
 
+        tqdm.tqdm.write('Writing to {}'.format(outfile), file=sys.stderr)
         self.writer = pd.ExcelWriter(outfile, engine='xlsxwriter')
         self.define_xlsx_styles()
 
         self.report_counts()
         self.report_tm()
+        self.report_topic_sentiment()
         self.report_wordclouds()
         self.report_dominant_topics()
         self.report_termite_plot()
@@ -658,3 +716,5 @@ class simple_textmining:
         self.report_settings()
 
         self.writer.save()
+        self.writer.close()
+        tqdm.tqdm.write('Saved.', file=sys.stderr)
